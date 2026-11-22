@@ -14,12 +14,12 @@ android {
         applicationId = "com.arena.aid"
         minSdk = 24
         targetSdk = 36
-        versionCode = 1
-        versionName = "1.0.0"
+        versionCode = 2
+        versionName = "1.1.0"
 
         val googleWebClientId = System.getenv("GOOGLE_WEB_CLIENT_ID")
             ?: (project.findProperty("GOOGLE_WEB_CLIENT_ID") as? String)
-            ?: "68143624035-que25r0vmrke4agasr715j5u9p8gic2s.apps.googleusercontent.com"
+            ?: "899073161779-tneq1jnh66s8kfvckhedkhp8kvkj8lnp.apps.googleusercontent.com"
         buildConfigField("String", "GOOGLE_WEB_CLIENT_ID", "\"$googleWebClientId\"")
         buildConfigField("String", "ARENA_BASE_URL", "\"https://arena.ai\"")
 

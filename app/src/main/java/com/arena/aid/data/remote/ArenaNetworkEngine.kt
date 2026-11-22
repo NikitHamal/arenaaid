@@ -1,23 +1,26 @@
 package com.arena.aid.data.remote
 
+import com.arena.aid.data.model.ArenaCatalog
+import com.arena.aid.data.model.ArenaMode
 import com.arena.aid.data.model.ArenaModelInfo
 import com.arena.aid.data.model.ArenaUserProfile
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.flowOn
-import kotlinx.coroutines.Job
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonNull
 import kotlinx.serialization.json.JsonObject
-import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.booleanOrNull
 import kotlinx.serialization.json.buildJsonArray
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.contentOrNull
+import kotlinx.serialization.json.intOrNull
 import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
@@ -27,27 +30,124 @@ import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import java.net.URLEncoder
-import java.security.SecureRandom
-import java.util.UUID
 import javax.inject.Inject
 import javax.inject.Singleton
 
 data class StreamChunk(
     val text: String = "",
     val reasoning: String = "",
-    val error: String? = null
+    val error: String? = null,
+    val extractedCookie: String? = null
 )
 
 @Singleton
-class ArenaNetworkEngine @Inject constructor(
+class ArenaNetworkEngine(
     private val client: OkHttpClient,
-    private val json: Json
+    private val json: Json,
+    private val bridge: ArenaSessionBridge? = null
 ) {
+    @Inject
+    constructor(
+        client: OkHttpClient,
+        json: Json,
+        bridge: ArenaSessionBridge
+    ) : this(client, json, bridge as ArenaSessionBridge?)
+
     private val jsonType = "application/json; charset=utf-8".toMediaType()
 
-    /** True when at least one real backend is configured. */
     fun isConnected(user: ArenaUserProfile?): Boolean =
-        user != null && (user.customApiKey.isNotBlank() || user.sessionCookie.isNotBlank())
+        user != null && (user.customApiKey.isNotBlank() || user.sessionCookie.isNotBlank() || bridge?.hasAuthCookie() == true)
+
+    suspend fun autoExtractCookie(forceSignUp: Boolean = false): String =
+        bridge?.autoExtractCookie(forceSignUp).orEmpty()
+
+    /**
+     * Scrapes live `initialModels` directly from `https://arena.ai/?mode=direct` RSC payload
+     * and updates ArenaCatalog with the exact models currently in arena.ai's Model Selector.
+     */
+    suspend fun scrapeLiveModels(): List<ArenaModelInfo> = withContext(Dispatchers.IO) {
+        runCatching {
+            val req = Request.Builder()
+                .url("https://arena.ai/?mode=direct")
+                .header("User-Agent", ArenaSessionBridge.USER_AGENT)
+                .build()
+            client.newCall(req).execute().use { resp ->
+                val html = resp.body?.string().orEmpty()
+                if (!resp.isSuccessful || html.isBlank()) return@use emptyList()
+                parseInitialModelsFromHtml(html).also { ArenaCatalog.updateLiveModels(it) }
+            }
+        }.getOrDefault(emptyList())
+    }
+
+    internal fun parseInitialModelsFromHtml(html: String): List<ArenaModelInfo> {
+        val chunkRegex = Regex("""self\.__next_f\.push\((\[1,".*?"\])\)""", setOf(RegexOption.DOT_MATCHES_ALL))
+        val full = buildString {
+            for (m in chunkRegex.findAll(html)) {
+                val arr = runCatching { json.parseToJsonElement(m.groupValues[1]).jsonArray }.getOrNull() ?: continue
+                if (arr.size > 1) append(arr[1].jsonPrimitive.contentOrNull.orEmpty())
+            }
+        }
+        val marker = "\"initialModels\":"
+        val start = full.indexOf(marker)
+        if (start == -1) return emptyList()
+        val arrStart = full.indexOf('[', start + marker.length)
+        if (arrStart == -1) return emptyList()
+        var depth = 0
+        var inStr = false
+        var esc = false
+        var arrEnd = -1
+        for (i in arrStart until full.length) {
+            val c = full[i]
+            if (esc) { esc = false; continue }
+            if (c == '\\' && inStr) { esc = true; continue }
+            if (c == '"') { inStr = !inStr; continue }
+            if (!inStr) {
+                if (c == '[') depth++
+                else if (c == ']') {
+                    depth--
+                    if (depth == 0) { arrEnd = i; break }
+                }
+            }
+        }
+        if (arrEnd == -1) return emptyList()
+        val rawArr = runCatching { json.parseToJsonElement(full.substring(arrStart, arrEnd + 1)).jsonArray }.getOrNull()
+            ?: return emptyList()
+        val out = mutableListOf<ArenaModelInfo>()
+        for (el in rawArr) {
+            val o = el as? JsonObject ?: continue
+            if (o["userSelectable"]?.jsonPrimitive?.booleanOrNull == false) continue
+            val id = o["id"]?.jsonPrimitive?.contentOrNull ?: continue
+            val pub = o["publicName"]?.jsonPrimitive?.contentOrNull ?: continue
+            val org = o["organization"]?.jsonPrimitive?.contentOrNull ?: continue
+            val caps = o["capabilities"]?.jsonObject?.get("outputCapabilities")?.jsonObject ?: continue
+            val modes = mutableSetOf<String>()
+            if (caps["text"]?.jsonPrimitive?.booleanOrNull == true) modes.add("chat")
+            if (caps["web"]?.jsonPrimitive?.booleanOrNull == true) modes.add("webdev")
+            if (caps["search"]?.jsonPrimitive?.booleanOrNull == true) modes.add("search")
+            if (modes.isEmpty()) continue
+            val isRouter = o["provider"]?.jsonPrimitive?.contentOrNull == "boss-bandit"
+            val fallbackRank = o["rank"]?.jsonPrimitive?.intOrNull ?: Int.MAX_VALUE
+            val ranks = o["rankByModality"]?.jsonObject
+            fun rFor(k: String): Int {
+                if (isRouter) return 0
+                val v = ranks?.get(k)?.jsonPrimitive?.intOrNull ?: fallbackRank
+                return if (v <= 0 || v > 100_000) fallbackRank.coerceAtLeast(200) else v
+            }
+            out.add(
+                ArenaModelInfo(
+                    id = id,
+                    slug = pub,
+                    displayName = o["displayName"]?.jsonPrimitive?.contentOrNull ?: pub,
+                    provider = ArenaCatalog.formatOrg(org),
+                    modalities = modes,
+                    rankChat = rFor("chat"),
+                    rankCode = rFor("webdev"),
+                    rankSearch = rFor("search")
+                )
+            )
+        }
+        return out
+    }
 
     suspend fun webSearch(query: String): String = withContext(Dispatchers.IO) {
         val q = URLEncoder.encode(query.replace(Regex("[^\\p{L}\\p{N} ]"), " ").trim().take(80), "UTF-8")
@@ -75,15 +175,29 @@ class ArenaNetworkEngine @Inject constructor(
         system: String,
         model: ArenaModelInfo,
         user: ArenaUserProfile?,
-        coalesceMs: Long
+        coalesceMs: Long,
+        mode: ArenaMode = ArenaMode.CHAT
     ): Flow<StreamChunk> = flow {
         val key = user?.customApiKey.orEmpty().trim()
-        val cookie = user?.sessionCookie.orEmpty().trim()
-        when {
-            key.isNotBlank() -> openAiStream(user!!, key, history, system, model, coalesceMs)
-            cookie.isNotBlank() -> arenaStream(cookie, history, system, model, coalesceMs)
-            else -> emit(StreamChunk(error = "Not connected. Open Settings and connect arena.ai or add an API key."))
+        val savedCookie = user?.sessionCookie.orEmpty().trim()
+        if (key.isNotBlank()) {
+            openAiStream(user!!, key, history, system, model, coalesceMs)
+            return@flow
         }
+        var activeCookie = savedCookie
+        if (activeCookie.isNotBlank()) {
+            bridge?.syncCookieToSystem(activeCookie)
+        } else if (bridge != null) {
+            activeCookie = bridge.autoExtractCookie(forceSignUp = false)
+            if (activeCookie.isNotBlank()) {
+                emit(StreamChunk(extractedCookie = activeCookie))
+            }
+        }
+        if (activeCookie.isBlank() && bridge == null) {
+            emit(StreamChunk(error = "Not connected. Tap Auto-Extract Cookie in Connection settings or add an API key."))
+            return@flow
+        }
+        arenaStream(activeCookie, history, system, model, mode, coalesceMs)
     }.flowOn(Dispatchers.IO)
 
     private class Batcher(val ms: Long) {
@@ -134,53 +248,95 @@ class ArenaNetworkEngine @Inject constructor(
     }
 
     private suspend fun kotlinx.coroutines.flow.FlowCollector<StreamChunk>.arenaStream(
-        cookie: String, history: List<ChatTurn>, system: String,
-        model: ArenaModelInfo, coalesceMs: Long
+        cookie: String,
+        history: List<ChatTurn>,
+        system: String,
+        model: ArenaModelInfo,
+        mode: ArenaMode,
+        coalesceMs: Long
     ) {
-        val evalId = uuidV7()
-        val userMsgId = uuidV7()
-        val modelMsgId = uuidV7()
+        val resolvedModel = if (ArenaCatalog.isUuid(model.id)) model else ArenaCatalog.byId(model.id)
+        val evalId = ArenaClientInteraction.uuidV7()
+        val userMsgId = ArenaClientInteraction.uuidV7()
+        val modelMsgId = ArenaClientInteraction.uuidV7()
         val prompt = buildString {
             if (system.isNotBlank()) append("[Instructions] ").append(system).append("\n\n")
             if (history.size > 1) {
-                history.dropLast(1).forEach { append(if (it.role == "user") "User: " else "Assistant: ").append(it.content).append("\n") }
+                history.dropLast(1).forEach {
+                    append(if (it.role == "user") "User: " else "Assistant: ").append(it.content).append("\n")
+                }
                 append("\n")
             }
             append(history.lastOrNull()?.content.orEmpty())
         }
-        fun msg(id: String, role: String, content: String, parents: List<String>, pos: String, modelId: String?, status: String) =
-            buildJsonObject {
-                put("id", id); put("role", role); put("content", content)
-                put("experimental_attachments", JsonArray(emptyList()))
-                put("parentMessageIds", JsonArray(parents.map { JsonPrimitive(it) }))
-                put("participantPosition", pos)
-                put("modelId", modelId?.let { JsonPrimitive(it) } ?: JsonNull)
-                put("evaluationSessionId", evalId)
-                put("status", status)
-                put("failureReason", JsonNull)
-            }
+        val modality = when {
+            mode == ArenaMode.AGENT && "search" in resolvedModel.modalities -> "search"
+            else -> "chat"
+        }
         val payload = buildJsonObject {
-            put("id", evalId); put("mode", "direct"); put("modelAId", model.id)
-            put("userMessageId", userMsgId); put("modelAMessageId", modelMsgId)
-            put("modality", "chat")
-            put("messages", JsonArray(listOf(
-                msg(userMsgId, "user", prompt, emptyList(), "a", null, "success"),
-                msg(modelMsgId, "assistant", "", listOf(userMsgId), "a", model.id, "pending")
-            )))
+            put("id", evalId)
+            put("mode", "direct")
+            put("modality", modality)
+            put("modelAId", resolvedModel.id)
+            put("userMessageId", userMsgId)
+            put("modelAMessageId", modelMsgId)
+            put("userMessage", buildJsonObject {
+                put("content", prompt)
+                put("experimental_attachments", JsonArray(emptyList()))
+                put("metadata", buildJsonObject {})
+            })
+            put("cx", ArenaClientInteraction.encode(prompt.length, evalId))
         }.toString()
+
+        if (bridge != null) {
+            val batcher = Batcher(coalesceMs.coerceAtLeast(16L))
+            var streamErr: String? = null
+            val bridgeErr = bridge.streamViaWebView("/nextjs-api/stream/create-evaluation", payload) { line ->
+                runCatching { parseArenaLine(line, batcher) }.onFailure { streamErr = it.message }
+                if (batcher.due()) emit(batcher.take())
+            }
+            if (batcher.pending()) emit(batcher.take())
+            val freshCookie = bridge.readCookie()
+            if (freshCookie.isNotBlank() && freshCookie != cookie) {
+                emit(StreamChunk(extractedCookie = freshCookie))
+            }
+            if (streamErr != null) {
+                emit(StreamChunk(error = streamErr))
+                return
+            }
+            if (bridgeErr == null) return
+        }
+
         val req = Request.Builder().url("https://arena.ai/nextjs-api/stream/create-evaluation")
-            .header("Cookie", cookie).header("Origin", "https://arena.ai")
+            .header("Cookie", cookie)
+            .header("Origin", "https://arena.ai")
             .header("Referer", "https://arena.ai/?mode=direct")
-            .header("User-Agent", "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 Chrome/124 Mobile Safari/537.36")
+            .header("User-Agent", ArenaSessionBridge.USER_AGENT)
             .post(payload.toRequestBody(jsonType)).build()
-        readLines(req, coalesceMs) { line, b ->
-            val prefix = line.substringBefore(':', "")
-            val value = line.substringAfter(':', "")
-            val s = runCatching { json.parseToJsonElement(value).jsonPrimitive.content }.getOrDefault("")
-            when (prefix) {
-                "a0" -> b.add(s, "")
-                "ag" -> b.add("", s)
-                "a3" -> throw java.io.IOException(s.ifBlank { "arena.ai returned an error" })
+        readLines(req, coalesceMs) { line, b -> parseArenaLine(line, b) }
+    }
+
+    private fun parseArenaLine(line: String, b: Batcher) {
+        val prefix = line.substringBefore(':', "")
+        val value = line.substringAfter(':', "")
+        when (prefix) {
+            "a0" -> {
+                val s = runCatching { json.parseToJsonElement(value).jsonPrimitive.content }.getOrDefault("")
+                b.add(s, "")
+            }
+            "ag" -> {
+                val s = runCatching { json.parseToJsonElement(value).jsonPrimitive.content }.getOrDefault("")
+                b.add("", s)
+            }
+            "ah" -> {
+                val obj = runCatching { json.parseToJsonElement(value).jsonObject }.getOrNull()
+                val url = obj?.get("url")?.jsonPrimitive?.contentOrNull
+                val title = obj?.get("title")?.jsonPrimitive?.contentOrNull ?: url
+                if (!url.isNullOrBlank()) b.add("\n- [$title]($url)", "")
+            }
+            "a3" -> {
+                val s = runCatching { json.parseToJsonElement(value).jsonPrimitive.content }.getOrDefault("")
+                throw java.io.IOException(s.ifBlank { "arena.ai returned an error" })
             }
         }
     }
@@ -217,16 +373,5 @@ class ArenaNetworkEngine @Inject constructor(
                 emit(StreamChunk(error = e.message ?: "Connection lost"))
             }
         }
-    }
-
-    private fun uuidV7(): String {
-        val r = SecureRandom()
-        val b = ByteArray(16).also { r.nextBytes(it) }
-        val ts = System.currentTimeMillis()
-        for (i in 0..5) b[i] = (ts shr (8 * (5 - i))).toByte()
-        b[6] = ((b[6].toInt() and 0x0F) or 0x70).toByte()
-        b[8] = ((b[8].toInt() and 0x3F) or 0x80).toByte()
-        val hex = b.joinToString("") { "%02x".format(it) }
-        return "${hex.substring(0, 8)}-${hex.substring(8, 12)}-${hex.substring(12, 16)}-${hex.substring(16, 20)}-${hex.substring(20)}"
     }
 }

@@ -27,7 +27,7 @@ data class ArenaAppSettings(
     val reducedMotion: Boolean = false,
     val streamFrameCoalesceMs: Long = 24L,
     val agentAutopilotDefault: Boolean = true,
-    val defaultDirectModelId: String = "019a98f7-afcd-779f-8dcb-gemini31pro",
+    val defaultDirectModelId: String = "01a141d8-c8f9-710a-bdf4-983605ae330c",
     val systemInstructions: String = "Be concise, accurate, and production-ready."
 )
 
@@ -103,8 +103,8 @@ class ArenaPreferences @Inject constructor(
             agentAutopilotDefault = prefs.getBoolean("agent_autopilot", true),
             defaultDirectModelId = prefs.getString(
                 "default_model_id",
-                "019a98f7-afcd-779f-8dcb-gemini31pro"
-            ) ?: "019a98f7-afcd-779f-8dcb-gemini31pro",
+                "01a141d8-c8f9-710a-bdf4-983605ae330c"
+            ) ?: "01a141d8-c8f9-710a-bdf4-983605ae330c",
             systemInstructions = prefs.getString(
                 "system_instructions",
                 "Be concise, accurate, and production-ready."

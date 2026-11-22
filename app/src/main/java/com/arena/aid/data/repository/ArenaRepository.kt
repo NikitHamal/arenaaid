@@ -29,6 +29,16 @@ class ArenaRepository @Inject constructor(
     fun observeArtifacts(id: String): Flow<List<CodeArtifactEntity>> = dao.observeArtifacts(id)
     fun observeAgentSteps(id: String): Flow<List<AgentStepEntity>> = dao.observeAgentSteps(id)
 
+    suspend fun syncLiveCatalog(): List<ArenaModelInfo> = network.scrapeLiveModels()
+
+    suspend fun autoExtractCookie(forceSignUp: Boolean = false): String {
+        val cookie = network.autoExtractCookie(forceSignUp).trim()
+        if (cookie.isNotBlank()) {
+            prefs.userFlow.value?.let { u -> prefs.saveUser(u.copy(sessionCookie = cookie)) }
+        }
+        return cookie
+    }
+
     suspend fun createSession(mode: ArenaMode, model: ArenaModelInfo, title: String = ""): ChatSessionEntity {
         val session = ChatSessionEntity(
             id = UUID.randomUUID().toString(),
@@ -102,11 +112,14 @@ class ArenaRepository @Inject constructor(
             )
         )
         try {
-            network.stream(turns, system, model, user, settings.streamFrameCoalesceMs.coerceAtLeast(48L))
+            network.stream(turns, system, model, user, settings.streamFrameCoalesceMs.coerceAtLeast(48L), mode)
                 .collect { c ->
+                    if (!c.extractedCookie.isNullOrBlank()) {
+                        prefs.userFlow.value?.let { u -> prefs.saveUser(u.copy(sessionCookie = c.extractedCookie)) }
+                    }
                     text.append(c.text); reasoning.append(c.reasoning)
                     if (c.error != null) error = c.error
-                    save()
+                    if (c.text.isNotEmpty() || c.reasoning.isNotEmpty() || c.error != null) save()
                 }
         } finally {
             if (text.isNotEmpty() || error != null) {

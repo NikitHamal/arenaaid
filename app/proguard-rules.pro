@@ -70,3 +70,9 @@
 -keep class androidx.credentials.** { *; }
 -keep class com.google.android.libraries.identity.googleid.** { *; }
 -dontwarn com.google.android.gms.**
+
+# Keep WebView JavascriptInterface methods for ArenaSessionBridge in release APK
+-keepclassmembers class * {
+    @android.webkit.JavascriptInterface <methods>;
+}
+-keep class com.arena.aid.data.remote.ArenaSessionBridge$* { *; }

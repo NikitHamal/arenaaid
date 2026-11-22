@@ -52,10 +52,23 @@ class ArenaViewModel @Inject constructor(
     private val _streaming = MutableStateFlow(false)
     val streaming: StateFlow<Boolean> = _streaming.asStateFlow()
 
+    private val _extractingCookie = MutableStateFlow(false)
+    val extractingCookie: StateFlow<Boolean> = _extractingCookie.asStateFlow()
+
     private val _toasts = MutableSharedFlow<String>(extraBufferCapacity = 8)
     val toasts: SharedFlow<String> = _toasts.asSharedFlow()
 
     private var job: Job? = null
+
+    init {
+        viewModelScope.launch {
+            repository.syncLiveCatalog()
+            _model.value = ArenaCatalog.forModeOrFallback(_model.value, _mode.value)
+            if (user.value != null && user.value?.sessionCookie.isNullOrBlank()) {
+                repository.autoExtractCookie(forceSignUp = false)
+            }
+        }
+    }
 
     val sessions: StateFlow<List<ChatSessionEntity>> = repository.observeSessions()
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
@@ -74,7 +87,36 @@ class ArenaViewModel @Inject constructor(
 
     fun toast(message: String) { _toasts.tryEmit(message) }
 
-    fun setMode(mode: ArenaMode) { _mode.value = mode }
+    fun setMode(mode: ArenaMode) {
+        _mode.value = mode
+        _model.value = ArenaCatalog.forModeOrFallback(_model.value, mode)
+    }
+
+    fun refreshModels() {
+        viewModelScope.launch {
+            val fetched = repository.syncLiveCatalog()
+            _model.value = ArenaCatalog.forModeOrFallback(_model.value, _mode.value)
+            if (fetched.isNotEmpty()) toast("Synced ${fetched.size} arena.ai models")
+        }
+    }
+
+    fun autoExtractArenaCookie(forceSignUp: Boolean = true, onExtracted: (String) -> Unit = {}) {
+        if (_extractingCookie.value) return
+        viewModelScope.launch {
+            _extractingCookie.value = true
+            try {
+                val cookie = repository.autoExtractCookie(forceSignUp = forceSignUp)
+                if (cookie.isNotBlank()) {
+                    onExtracted(cookie)
+                    toast("Extracted arena.ai session cookie")
+                } else {
+                    toast("Could not auto-extract cookie yet. Sign in via the interactive scraper.")
+                }
+            } finally {
+                _extractingCookie.value = false
+            }
+        }
+    }
 
     fun selectModel(model: ArenaModelInfo) {
         _model.value = model
@@ -148,16 +190,18 @@ class ArenaViewModel @Inject constructor(
 
     private fun saveProfile(name: String, email: String, method: String) {
         val old = user.value
-        prefs.saveUser(
-            ArenaUserProfile(
-                id = old?.id ?: UUID.randomUUID().toString(),
-                name = name.trim().ifBlank { email.substringBefore("@").replaceFirstChar { it.uppercase() } },
-                email = email, authMethod = method,
-                sessionCookie = old?.sessionCookie.orEmpty(),
-                customApiUrl = old?.customApiUrl ?: "https://openrouter.ai/api",
-                customApiKey = old?.customApiKey.orEmpty()
-            )
+        val profile = ArenaUserProfile(
+            id = old?.id ?: UUID.randomUUID().toString(),
+            name = name.trim().ifBlank { email.substringBefore("@").replaceFirstChar { it.uppercase() } },
+            email = email, authMethod = method,
+            sessionCookie = old?.sessionCookie.orEmpty(),
+            customApiUrl = old?.customApiUrl ?: "https://openrouter.ai/api",
+            customApiKey = old?.customApiKey.orEmpty()
         )
+        prefs.saveUser(profile)
+        if (profile.sessionCookie.isBlank()) {
+            autoExtractArenaCookie(forceSignUp = false)
+        }
     }
 
     fun saveConnection(cookie: String, apiUrl: String, apiKey: String) {

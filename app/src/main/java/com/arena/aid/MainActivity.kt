@@ -81,6 +81,7 @@ private fun ArenaRoot(vm: ArenaViewModel) {
     val steps by vm.agentSteps.collectAsState()
     val artifacts by vm.artifacts.collectAsState()
     val streaming by vm.streaming.collectAsState()
+    val extractingCookie by vm.extractingCookie.collectAsState()
 
     val snackbar = remember { SnackbarHostState() }
     val drawer = rememberDrawerState(DrawerValue.Closed)
@@ -94,7 +95,6 @@ private fun ArenaRoot(vm: ArenaViewModel) {
     LaunchedEffect(Unit) { vm.toasts.collect { snackbar.showSnackbar(it) } }
 
     val signedIn = user != null
-    val connected = user?.let { it.sessionCookie.isNotBlank() || it.customApiKey.isNotBlank() } == true
 
     Box(Modifier.fillMaxSize()) {
         if (!signedIn) {
@@ -129,9 +129,9 @@ private fun ArenaRoot(vm: ArenaViewModel) {
                     onMenu = { scope.launch { drawer.open() } },
                     onNewChat = vm::newChat, onModeChange = vm::setMode,
                     onModelClick = { showModels = true }, onFilesClick = { showFiles = true },
-                    onSend = { if (connected) vm.send(it) else { showConnection = true; vm.toast("Connect arena.ai or add an API key first") } },
+                    onSend = vm::send,
                     onStop = vm::stop,
-                    onRetry = { if (connected) vm.retry(it) else showConnection = true },
+                    onRetry = vm::retry,
                     onToast = vm::toast
                 )
             }
@@ -146,10 +146,24 @@ private fun ArenaRoot(vm: ArenaViewModel) {
                     )
                 }
             }
-            if (showModels) ModelSheet(model, vm::selectModel) { showModels = false }
+            if (showModels) {
+                ModelSheet(
+                    mode = mode,
+                    selected = model,
+                    onSelect = vm::selectModel,
+                    onRefresh = vm::refreshModels,
+                    onDismiss = { showModels = false }
+                )
+            }
             if (showFiles) FilesSheet(artifacts, vm::toast) { showFiles = false }
             if (showConnection) {
-                ConnectionSheet(user, { showConnection = false }, vm::saveConnection)
+                ConnectionSheet(
+                    user = user,
+                    extracting = extractingCookie,
+                    onAutoExtract = { cb -> vm.autoExtractArenaCookie(forceSignUp = true, onExtracted = cb) },
+                    onDismiss = { showConnection = false },
+                    onSave = vm::saveConnection
+                )
             }
             renaming?.let { s ->
                 var title by remember(s.id) { mutableStateOf(s.title) }
