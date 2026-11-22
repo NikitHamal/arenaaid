@@ -106,7 +106,7 @@ def ci_status() -> int:
     if not runs:
         print("No CI runs yet.")
         return 0
-    for r in runs[:2]:
+    for r in runs[:1]:
         print(f"Run #{r['run_number']} [{r['status']}/{r.get('conclusion')}] {r['name']} ({r['head_sha'][:7]}) -> {r['html_url']}")
         jobs_req = urllib.request.Request(r["jobs_url"], headers=headers)
         with urllib.request.urlopen(jobs_req) as jresp:
