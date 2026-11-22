@@ -1,0 +1,83 @@
+name: Build Signed Release APK & Publish GitHub Release
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-arena-apk:
+    name: Build Signed Arena APK
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Verify M3X Design System & RSI Guards
+        run: python3 tools/rsi/rsi.py verify
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          cache-read-only: false
+
+      - name: Ensure Single Release Keystore
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_FILE }}
+        run: |
+          if [ -n "$KEYSTORE_BASE64" ] && [ ! -f arena-release.keystore ]; then
+            echo "$KEYSTORE_BASE64" | base64 -d > arena-release.keystore
+          fi
+          ls -la arena-release.keystore
+
+      - name: Build Single Signed Release APK
+        run: ./gradlew assembleRelease --build-cache
+        env:
+          GRADLE_OPTS: -Dorg.gradle.jvmargs="-Xmx4g -XX:+UseParallelGC -XX:MaxMetaspaceSize=1g" -Dorg.gradle.parallel=true -Dorg.gradle.caching=true -Dorg.gradle.configuration-cache=true
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD || 'arenakeystore' }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS || 'arena' }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD || 'arenakeystore' }}
+
+      - name: Prepare Signed APK Metadata
+        id: info
+        run: |
+          VERSION=$(grep 'versionName' app/build.gradle.kts | head -1 | sed 's/.*versionName\s*=\s*"\(.*\)"/\1/')
+          HASH=$(echo "${{ github.sha }}" | cut -c1-7)
+          APK_PATH=$(find app/build/outputs/apk/release -name "*.apk" | head -n 1)
+          FINAL_APK="Arena-v${VERSION}-${HASH}-release.apk"
+          cp "$APK_PATH" "$FINAL_APK"
+          cp "$APK_PATH" "Arena-release.apk"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "hash=$HASH" >> "$GITHUB_OUTPUT"
+          echo "apk=$FINAL_APK" >> "$GITHUB_OUTPUT"
+
+      - name: Upload Signed Release APK Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Arena-v${{ steps.info.outputs.version }}-${{ steps.info.outputs.hash }}
+          path: ${{ steps.info.outputs.apk }}
+          retention-days: 30
+
+      - name: Publish GitHub Release with Single Signed APK
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="v${{ steps.info.outputs.version }}-${{ steps.info.outputs.hash }}"
+          gh release create "$TAG" \
+            "${{ steps.info.outputs.apk }}" \
+            "Arena-release.apk" \
+            --title "Arena v${{ steps.info.outputs.version }} (${{ steps.info.outputs.hash }})" \
+            --notes "Signed single universal release APK for Arena (\`com.arena.aid\`). Built with Kotlin, Jetpack Compose, Material 3 Expressive (\`m3x\`), Poppins typography, and Low-RAM Turbo Engine for 4GB RAM / Android Go devices." \
+            --latest || \
+          gh release upload "$TAG" "${{ steps.info.outputs.apk }}" "Arena-release.apk" --clobber
