@@ -71,8 +71,8 @@ object ArenaClientInteraction {
         var seed = (0x5bd1e995 xor (salt and 0xFFFF))
         fun nextRand(): Int {
             seed += 0x6d2b79f5
-            var e = Integer.imul(seed xor (seed ushr 15), 1 or seed)
-            e = e xor (e + Integer.imul(e xor (e ushr 7), 61 or e))
+            var e = imul(seed xor (seed ushr 15), 1 or seed)
+            e = e xor (e + imul(e xor (e ushr 7), 61 or e))
             return (e xor (e ushr 14))
         }
 
@@ -121,12 +121,12 @@ object ArenaClientInteraction {
         var h = 0x811c9dc5.toInt()
         for (ch in input) {
             h = h xor ch.code
-            h = Integer.imul(h, 0x01000193)
+            h = imul(h, 0x01000193)
         }
         return (h xor (h ushr 16)) and 0xFFFF
     }
 
-    private fun Int.Companion.imul(a: Int, b: Int): Int = (a.toLong() * b.toLong()).toInt()
+    private fun imul(a: Int, b: Int): Int = a * b
 
     private fun toBase64Url(bytes: ByteArray): String {
         val sb = StringBuilder()
