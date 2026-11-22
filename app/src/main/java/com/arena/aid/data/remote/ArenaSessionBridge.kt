@@ -112,6 +112,8 @@ class ArenaSessionBridge @Inject constructor(
                     pageReady = true
                 }
             }
+            onResume()
+            resumeTimers()
             pageFresh = true
             loadUrl(ARENA_URL)
         }

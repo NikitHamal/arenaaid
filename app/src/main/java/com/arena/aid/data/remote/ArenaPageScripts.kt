@@ -32,8 +32,8 @@ function arenaSiteKey(dflt){
     val STATE_JS = """
 (function(){
   var t = document.title || '';
-  var cf = /just a moment|attention required|verify you are human/i.test(t) ||
-    !!document.querySelector('#challenge-form, #cf-challenge-running, .cf-turnstile, #challenge-running');
+  var cf = /just a moment|attention required/i.test(t) ||
+    !!document.querySelector('#challenge-form, #cf-challenge-running, #challenge-running');
   var ta = !!document.querySelector('textarea, [contenteditable="true"]');
   var rc = !!(window.grecaptcha && window.grecaptcha.enterprise);
   return 'cf=' + (cf ? 1 : 0) + ';ta=' + (ta ? 1 : 0) + ';rc=' + (rc ? 1 : 0);
