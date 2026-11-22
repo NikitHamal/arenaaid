@@ -97,6 +97,9 @@ interface ArenaDao {
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun upsertMessage(message: MessageEntity)
 
+    @Query("DELETE FROM messages WHERE id = :id")
+    suspend fun deleteMessage(id: String)
+
     @Query("SELECT * FROM code_artifacts WHERE sessionId = :sessionId ORDER BY updatedAt ASC")
     fun observeArtifacts(sessionId: String): Flow<List<CodeArtifactEntity>>
 

@@ -133,6 +133,8 @@ class ArenaPreferences @Inject constructor(
             .remove("user_email")
             .remove("user_auth_method")
             .remove("user_avatar")
+            .remove("arena_cookie")
+            .remove("custom_api_key")
             .apply()
         _userFlow.value = null
     }
