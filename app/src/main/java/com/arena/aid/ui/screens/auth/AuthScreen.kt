@@ -45,6 +45,7 @@ import androidx.credentials.CredentialManager
 import androidx.credentials.CustomCredential
 import androidx.credentials.GetCredentialRequest
 import com.arena.aid.BuildConfig
+import com.arena.aid.data.remote.ArenaClientInteraction
 import com.arena.aid.data.remote.ArenaSessionBridge
 import com.arena.aid.ui.components.ArenaAvatar
 import com.arena.aid.ui.components.ArenaButton
@@ -165,7 +166,7 @@ private fun ArenaGoogleAuthSheet(
             if (c.contains("arena-auth")) {
                 hasCookie = true
             }
-            delay(500L)
+            delay(400L)
         }
     }
 
@@ -190,10 +191,22 @@ private fun ArenaGoogleAuthSheet(
                     WebView(ctx).apply {
                         settings.javaScriptEnabled = true
                         settings.domStorageEnabled = true
-                        settings.userAgentString = ArenaSessionBridge.USER_AGENT
+                        settings.databaseEnabled = true
+                        settings.userAgentString = ArenaSessionBridge.sanitizeWebViewUa(settings.userAgentString)
                         cm.setAcceptThirdPartyCookies(this, true)
-                        webViewClient = WebViewClient()
-                        loadUrl("https://arena.ai/nextjs-api/sign-in/google?shouldLinkHistory=true&returnTo=%2F%3Fmode%3Ddirect")
+                        webViewClient = object : WebViewClient() {
+                            override fun onPageFinished(view: WebView?, url: String?) {
+                                val u = url.orEmpty()
+                                val current = runCatching { cm.getCookie("https://arena.ai").orEmpty() }.getOrDefault("")
+                                if (u.startsWith("https://arena.ai") && !current.contains("arena-auth")) {
+                                    view?.evaluateJavascript(
+                                        ArenaSessionBridge.signUpJs(ArenaClientInteraction.uuidV7()),
+                                        null
+                                    )
+                                }
+                            }
+                        }
+                        loadUrl(ArenaSessionBridge.GOOGLE_SIGN_IN_URL)
                     }
                 }
             )

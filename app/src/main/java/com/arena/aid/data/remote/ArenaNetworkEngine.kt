@@ -43,15 +43,18 @@ data class StreamChunk(
 @Singleton
 class ArenaNetworkEngine(
     private val client: OkHttpClient,
-    private val json: Json,
-    private val bridge: ArenaSessionBridge? = null
+    private val json: Json
 ) {
+    private var bridge: ArenaSessionBridge? = null
+
     @Inject
     constructor(
         client: OkHttpClient,
         json: Json,
         bridge: ArenaSessionBridge
-    ) : this(client, json, bridge as ArenaSessionBridge?)
+    ) : this(client, json) {
+        this.bridge = bridge
+    }
 
     private val jsonType = "application/json; charset=utf-8".toMediaType()
 
@@ -62,14 +65,29 @@ class ArenaNetworkEngine(
         bridge?.autoExtractCookie(forceSignUp).orEmpty()
 
     /**
-     * Scrapes live `initialModels` directly from `https://arena.ai/?mode=direct` RSC payload
-     * and updates ArenaCatalog with the exact models currently in arena.ai's Model Selector.
+     * Scrapes live models from arena.ai via the WebView bridge (`/nextjs-api/model-catalog`
+     * or `window.__next_f` `initialModels`) with HTTP fallback, updating `ArenaCatalog`.
      */
     suspend fun scrapeLiveModels(): List<ArenaModelInfo> = withContext(Dispatchers.IO) {
+        val bridgePayload = runCatching { bridge?.scrapeModelsPayload().orEmpty() }.getOrDefault("")
+        if (bridgePayload.isNotBlank()) {
+            val fromCatalog = parseModelCatalogJson(bridgePayload)
+            if (fromCatalog.isNotEmpty()) {
+                ArenaCatalog.updateLiveModels(fromCatalog)
+                return@withContext fromCatalog
+            }
+            val fromNextF = parseInitialModelsFromRscText(bridgePayload)
+            if (fromNextF.isNotEmpty()) {
+                ArenaCatalog.updateLiveModels(fromNextF)
+                return@withContext fromNextF
+            }
+        }
         runCatching {
+            val cookie = bridge?.readCookie().orEmpty()
             val req = Request.Builder()
                 .url("https://arena.ai/?mode=direct")
                 .header("User-Agent", ArenaSessionBridge.USER_AGENT)
+                .apply { if (cookie.isNotBlank()) header("Cookie", cookie) }
                 .build()
             client.newCall(req).execute().use { resp ->
                 val html = resp.body?.string().orEmpty()
@@ -77,6 +95,52 @@ class ArenaNetworkEngine(
                 parseInitialModelsFromHtml(html).also { ArenaCatalog.updateLiveModels(it) }
             }
         }.getOrDefault(emptyList())
+    }
+
+    internal fun parseModelCatalogJson(raw: String): List<ArenaModelInfo> {
+        val trimmed = raw.trim()
+        if (!trimmed.startsWith("[")) return emptyList()
+        val arr = runCatching { json.parseToJsonElement(trimmed).jsonArray }.getOrNull() ?: return emptyList()
+        val arenaMap = mapOf(
+            "text" to "chat",
+            "vision" to "chat",
+            "document" to "chat",
+            "code" to "webdev",
+            "image-to-code" to "webdev",
+            "search" to "search"
+        )
+        val primaryArena = mapOf("chat" to "text", "webdev" to "code", "search" to "search")
+        val merged = linkedMapOf<String, ArenaModelInfo>()
+        for (entry in arr) {
+            val arenaObj = entry as? JsonObject ?: continue
+            val arenaKey = arenaObj["arena"]?.jsonPrimitive?.contentOrNull ?: continue
+            val modality = arenaMap[arenaKey] ?: continue
+            val isPrimary = primaryArena[modality] == arenaKey
+            val modelsArr = arenaObj["models"] as? JsonArray ?: continue
+            for (mEl in modelsArr) {
+                val o = mEl as? JsonObject ?: continue
+                if (o["userSelectable"]?.jsonPrimitive?.booleanOrNull == false) continue
+                val id = o["id"]?.jsonPrimitive?.contentOrNull ?: continue
+                val pub = o["publicName"]?.jsonPrimitive?.contentOrNull ?: continue
+                val org = o["organization"]?.jsonPrimitive?.contentOrNull ?: continue
+                val prov = o["provider"]?.jsonPrimitive?.contentOrNull ?: continue
+                if (prov == "boss-bandit" && !pub.equals("Max", ignoreCase = true)) continue
+                val rank = if (prov == "boss-bandit") 0 else (o["rank"]?.jsonPrimitive?.intOrNull ?: 200)
+                val prev = merged[id]
+                val modes = (prev?.modalities ?: emptySet()) + modality
+                merged[id] = ArenaModelInfo(
+                    id = id,
+                    slug = pub,
+                    displayName = o["displayName"]?.jsonPrimitive?.contentOrNull ?: pub,
+                    provider = ArenaCatalog.formatOrg(org),
+                    modalities = modes,
+                    rankChat = if (modality == "chat" && (isPrimary || prev == null)) rank else (prev?.rankChat ?: Int.MAX_VALUE),
+                    rankCode = if (modality == "webdev" && (isPrimary || prev == null)) rank else (prev?.rankCode ?: Int.MAX_VALUE),
+                    rankSearch = if (modality == "search" && (isPrimary || prev == null)) rank else (prev?.rankSearch ?: Int.MAX_VALUE)
+                )
+            }
+        }
+        return merged.values.toList()
     }
 
     internal fun parseInitialModelsFromHtml(html: String): List<ArenaModelInfo> {
@@ -87,6 +151,10 @@ class ArenaNetworkEngine(
                 if (arr.size > 1) append(arr[1].jsonPrimitive.contentOrNull.orEmpty())
             }
         }
+        return parseInitialModelsFromRscText(full.ifBlank { html })
+    }
+
+    internal fun parseInitialModelsFromRscText(full: String): List<ArenaModelInfo> {
         val marker = "\"initialModels\":"
         val start = full.indexOf(marker)
         if (start == -1) return emptyList()
@@ -119,13 +187,15 @@ class ArenaNetworkEngine(
             val id = o["id"]?.jsonPrimitive?.contentOrNull ?: continue
             val pub = o["publicName"]?.jsonPrimitive?.contentOrNull ?: continue
             val org = o["organization"]?.jsonPrimitive?.contentOrNull ?: continue
+            val prov = o["provider"]?.jsonPrimitive?.contentOrNull ?: continue
+            if (prov == "boss-bandit" && !pub.equals("Max", ignoreCase = true)) continue
             val caps = o["capabilities"]?.jsonObject?.get("outputCapabilities")?.jsonObject ?: continue
             val modes = mutableSetOf<String>()
             if (caps["text"]?.jsonPrimitive?.booleanOrNull == true) modes.add("chat")
             if (caps["web"]?.jsonPrimitive?.booleanOrNull == true) modes.add("webdev")
             if (caps["search"]?.jsonPrimitive?.booleanOrNull == true) modes.add("search")
             if (modes.isEmpty()) continue
-            val isRouter = o["provider"]?.jsonPrimitive?.contentOrNull == "boss-bandit"
+            val isRouter = prov == "boss-bandit"
             val fallbackRank = o["rank"]?.jsonPrimitive?.intOrNull ?: Int.MAX_VALUE
             val ranks = o["rankByModality"]?.jsonObject
             fun rFor(k: String): Int {
@@ -185,15 +255,16 @@ class ArenaNetworkEngine(
             return@flow
         }
         var activeCookie = savedCookie
+        val sessionBridge = bridge
         if (activeCookie.isNotBlank()) {
-            bridge?.syncCookieToSystem(activeCookie)
-        } else if (bridge != null) {
-            activeCookie = bridge.autoExtractCookie(forceSignUp = false)
+            sessionBridge?.syncCookieToSystem(activeCookie)
+        } else if (sessionBridge != null) {
+            activeCookie = sessionBridge.autoExtractCookie(forceSignUp = false)
             if (activeCookie.isNotBlank()) {
                 emit(StreamChunk(extractedCookie = activeCookie))
             }
         }
-        if (activeCookie.isBlank() && bridge == null) {
+        if (activeCookie.isBlank() && sessionBridge == null) {
             emit(StreamChunk(error = "Not connected. Tap Auto-Extract Cookie in Connection settings or add an API key."))
             return@flow
         }
@@ -271,6 +342,7 @@ class ArenaNetworkEngine(
         }
         val modality = when {
             mode == ArenaMode.AGENT && "search" in resolvedModel.modalities -> "search"
+            mode == ArenaMode.CODE && "webdev" in resolvedModel.modalities && "chat" !in resolvedModel.modalities -> "webdev"
             else -> "chat"
         }
         val payload = buildJsonObject {
@@ -288,15 +360,16 @@ class ArenaNetworkEngine(
             put("cx", ArenaClientInteraction.encode(prompt.length, evalId))
         }.toString()
 
-        if (bridge != null) {
+        val sessionBridge = bridge
+        if (sessionBridge != null) {
             val batcher = Batcher(coalesceMs.coerceAtLeast(16L))
             var streamErr: String? = null
-            val bridgeErr = bridge.streamViaWebView("/nextjs-api/stream/create-evaluation", payload) { line ->
+            val bridgeErr = sessionBridge.streamViaWebView("/nextjs-api/stream/create-evaluation", payload) { line ->
                 runCatching { parseArenaLine(line, batcher) }.onFailure { streamErr = it.message }
                 if (batcher.due()) emit(batcher.take())
             }
             if (batcher.pending()) emit(batcher.take())
-            val freshCookie = bridge.readCookie()
+            val freshCookie = sessionBridge.readCookie()
             if (freshCookie.isNotBlank() && freshCookie != cookie) {
                 emit(StreamChunk(extractedCookie = freshCookie))
             }
@@ -320,21 +393,21 @@ class ArenaNetworkEngine(
         val prefix = line.substringBefore(':', "")
         val value = line.substringAfter(':', "")
         when (prefix) {
-            "a0" -> {
+            "a0", "0" -> {
                 val s = runCatching { json.parseToJsonElement(value).jsonPrimitive.content }.getOrDefault("")
                 b.add(s, "")
             }
-            "ag" -> {
+            "ag", "g" -> {
                 val s = runCatching { json.parseToJsonElement(value).jsonPrimitive.content }.getOrDefault("")
                 b.add("", s)
             }
-            "ah" -> {
+            "ah", "h" -> {
                 val obj = runCatching { json.parseToJsonElement(value).jsonObject }.getOrNull()
                 val url = obj?.get("url")?.jsonPrimitive?.contentOrNull
                 val title = obj?.get("title")?.jsonPrimitive?.contentOrNull ?: url
                 if (!url.isNullOrBlank()) b.add("\n- [$title]($url)", "")
             }
-            "a3" -> {
+            "a3", "3" -> {
                 val s = runCatching { json.parseToJsonElement(value).jsonPrimitive.content }.getOrDefault("")
                 throw java.io.IOException(s.ifBlank { "arena.ai returned an error" })
             }

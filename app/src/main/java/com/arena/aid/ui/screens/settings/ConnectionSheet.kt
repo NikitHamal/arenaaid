@@ -34,6 +34,7 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import com.arena.aid.data.model.ArenaUserProfile
+import com.arena.aid.data.remote.ArenaClientInteraction
 import com.arena.aid.data.remote.ArenaSessionBridge
 import com.arena.aid.ui.components.ArenaButton
 import com.arena.aid.ui.components.ArenaButtonTone
@@ -152,6 +153,7 @@ private fun InteractiveCookieScraperSheet(
     onDismiss: () -> Unit
 ) {
     var detectedCookie by remember { mutableStateOf("") }
+    var webViewRef by remember { mutableStateOf<WebView?>(null) }
     val ready = detectedCookie.contains("arena-auth")
 
     LaunchedEffect(Unit) {
@@ -160,7 +162,7 @@ private fun InteractiveCookieScraperSheet(
                 CookieManager.getInstance().getCookie("https://arena.ai").orEmpty().trim()
             }.getOrDefault("")
             if (c.isNotBlank()) detectedCookie = c
-            delay(500L)
+            delay(400L)
         }
     }
 
@@ -171,16 +173,35 @@ private fun InteractiveCookieScraperSheet(
         ) {
             Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
                 Text(
-                    if (ready) "Session cookie detected" else "Loading arena.ai session...",
+                    if (ready) "arena-auth cookie ready" else "Generating session cookie...",
                     Modifier.weight(1f),
                     style = MaterialTheme.typography.bodyMedium
                 )
-                ArenaStatusChip(if (ready) "Ready" else "Waiting")
+                ArenaStatusChip(if (ready) "Ready" else "Extracting")
+            }
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                ArenaButton(
+                    text = "Google sign-in",
+                    tone = ArenaButtonTone.Tonal,
+                    modifier = Modifier.weight(1f),
+                    onClick = { webViewRef?.loadUrl(ArenaSessionBridge.GOOGLE_SIGN_IN_URL) }
+                )
+                ArenaButton(
+                    text = "Re-run scraper",
+                    tone = ArenaButtonTone.Outlined,
+                    modifier = Modifier.weight(1f),
+                    onClick = {
+                        webViewRef?.evaluateJavascript(
+                            ArenaSessionBridge.signUpJs(ArenaClientInteraction.uuidV7()),
+                            null
+                        )
+                    }
+                )
             }
             AndroidView(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .height(380.dp)
+                    .height(360.dp)
                     .clip(RoundedCornerShape(20.dp)),
                 factory = { ctx ->
                     val cm = CookieManager.getInstance()
@@ -188,15 +209,27 @@ private fun InteractiveCookieScraperSheet(
                     WebView(ctx).apply {
                         settings.javaScriptEnabled = true
                         settings.domStorageEnabled = true
-                        settings.userAgentString = ArenaSessionBridge.USER_AGENT
+                        settings.databaseEnabled = true
+                        settings.userAgentString = ArenaSessionBridge.sanitizeWebViewUa(settings.userAgentString)
                         cm.setAcceptThirdPartyCookies(this, true)
-                        webViewClient = WebViewClient()
+                        webViewClient = object : WebViewClient() {
+                            override fun onPageFinished(view: WebView?, url: String?) {
+                                val current = runCatching { cm.getCookie("https://arena.ai").orEmpty() }.getOrDefault("")
+                                if (!current.contains("arena-auth")) {
+                                    view?.evaluateJavascript(
+                                        ArenaSessionBridge.signUpJs(ArenaClientInteraction.uuidV7()),
+                                        null
+                                    )
+                                }
+                            }
+                        }
                         loadUrl(ArenaSessionBridge.ARENA_URL)
+                        webViewRef = this
                     }
                 }
             )
             ArenaButton(
-                text = if (ready) "Use extracted cookie" else "Capture current cookies",
+                text = if (ready) "Save extracted cookie" else "Capture current cookies",
                 enabled = detectedCookie.isNotBlank(),
                 height = 52.dp,
                 modifier = Modifier.fillMaxWidth(),
