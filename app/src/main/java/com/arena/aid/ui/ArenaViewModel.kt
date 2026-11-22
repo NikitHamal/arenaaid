@@ -206,6 +206,7 @@ class ArenaViewModel @Inject constructor(
 
     fun saveConnection(cookie: String, apiUrl: String, apiKey: String) {
         val u = user.value ?: return
+        if (cookie.contains("arena-auth")) repository.applyCookie(cookie.trim())
         prefs.saveUser(u.copy(sessionCookie = cookie.trim(), customApiUrl = apiUrl.trim(), customApiKey = apiKey.trim()))
         toast("Connection saved")
     }

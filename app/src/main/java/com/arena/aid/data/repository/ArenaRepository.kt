@@ -31,6 +31,8 @@ class ArenaRepository @Inject constructor(
 
     suspend fun syncLiveCatalog(): List<ArenaModelInfo> = network.scrapeLiveModels()
 
+    fun applyCookie(cookie: String) = network.applyCookie(cookie)
+
     suspend fun autoExtractCookie(forceSignUp: Boolean = false): String {
         val cookie = network.autoExtractCookie(forceSignUp).trim()
         if (cookie.isNotBlank()) {

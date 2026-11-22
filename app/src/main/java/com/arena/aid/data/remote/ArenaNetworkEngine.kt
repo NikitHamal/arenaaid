@@ -61,6 +61,9 @@ class ArenaNetworkEngine(
     fun isConnected(user: ArenaUserProfile?): Boolean =
         user != null && (user.customApiKey.isNotBlank() || user.sessionCookie.isNotBlank() || bridge?.hasAuthCookie() == true)
 
+    /** Pushes a user-provided cookie into the live arena.ai session. */
+    fun applyCookie(cookie: String) { bridge?.syncCookieToSystem(cookie, force = true) }
+
     suspend fun autoExtractCookie(forceSignUp: Boolean = false): String =
         bridge?.autoExtractCookie(forceSignUp).orEmpty()
 
@@ -71,15 +74,15 @@ class ArenaNetworkEngine(
     suspend fun scrapeLiveModels(): List<ArenaModelInfo> = withContext(Dispatchers.IO) {
         val bridgePayload = runCatching { bridge?.scrapeModelsPayload().orEmpty() }.getOrDefault("")
         if (bridgePayload.isNotBlank()) {
-            val fromCatalog = parseModelCatalogJson(bridgePayload)
-            if (fromCatalog.isNotEmpty()) {
-                ArenaCatalog.updateLiveModels(fromCatalog)
-                return@withContext fromCatalog
-            }
-            val fromNextF = parseInitialModelsFromRscText(bridgePayload)
-            if (fromNextF.isNotEmpty()) {
-                ArenaCatalog.updateLiveModels(fromNextF)
-                return@withContext fromNextF
+            val obj = runCatching { json.parseToJsonElement(bridgePayload) as? JsonObject }.getOrNull()
+            val catalogRaw = obj?.get("catalog")?.jsonPrimitive?.contentOrNull ?: bridgePayload
+            val rscRaw = obj?.get("rsc")?.jsonPrimitive?.contentOrNull ?: bridgePayload
+            val fromNextF = parseInitialModelsFromRscText(rscRaw)
+            val fromCatalog = parseModelCatalogJson(catalogRaw)
+            val best = if (fromCatalog.size >= fromNextF.size) fromCatalog else fromNextF
+            if (best.isNotEmpty()) {
+                ArenaCatalog.updateLiveModels(best)
+                return@withContext best
             }
         }
         runCatching {
@@ -357,15 +360,16 @@ class ArenaNetworkEngine(
                 put("experimental_attachments", JsonArray(emptyList()))
                 put("metadata", buildJsonObject {})
             })
-            put("cx", ArenaClientInteraction.encode(prompt.length, evalId))
         }.toString()
 
         val sessionBridge = bridge
         if (sessionBridge != null) {
             val batcher = Batcher(coalesceMs.coerceAtLeast(16L))
             var streamErr: String? = null
-            val bridgeErr = sessionBridge.streamViaWebView("/nextjs-api/stream/create-evaluation", payload) { line ->
-                runCatching { parseArenaLine(line, batcher) }.onFailure { streamErr = it.message }
+            var gotAny = false
+            val bridgeErr = sessionBridge.runChat(resolvedModel.id, modality, prompt, payload) { line ->
+                runCatching { parseArenaLine(line, batcher) }.onFailure { streamErr = streamErr ?: it.message }
+                if (batcher.pending()) gotAny = true
                 if (batcher.due()) emit(batcher.take())
             }
             if (batcher.pending()) emit(batcher.take())
@@ -373,11 +377,12 @@ class ArenaNetworkEngine(
             if (freshCookie.isNotBlank() && freshCookie != cookie) {
                 emit(StreamChunk(extractedCookie = freshCookie))
             }
-            if (streamErr != null) {
-                emit(StreamChunk(error = streamErr))
-                return
+            val failure = streamErr ?: bridgeErr
+            when {
+                failure != null -> emit(StreamChunk(error = failure))
+                !gotAny -> emit(StreamChunk(error = "arena.ai returned an empty response. Pick another model or retry."))
             }
-            if (bridgeErr == null) return
+            return
         }
 
         val req = Request.Builder().url("https://arena.ai/nextjs-api/stream/create-evaluation")
@@ -387,6 +392,21 @@ class ArenaNetworkEngine(
             .header("User-Agent", ArenaSessionBridge.USER_AGENT)
             .post(payload.toRequestBody(jsonType)).build()
         readLines(req, coalesceMs) { line, b -> parseArenaLine(line, b) }
+    }
+
+    /** Pulls a short human readable message out of an error response body (JSON or text). */
+    internal fun errorDetail(body: String): String {
+        val t = body.trim()
+        if (t.isBlank() || t.startsWith("<")) return ""
+        val msg = runCatching {
+            val o = json.parseToJsonElement(t).jsonObject
+            val err = o["error"]
+            (err as? JsonObject)?.get("message")?.jsonPrimitive?.contentOrNull
+                ?: err?.jsonPrimitive?.contentOrNull
+                ?: o["message"]?.jsonPrimitive?.contentOrNull
+                ?: o["detail"]?.jsonPrimitive?.contentOrNull
+        }.getOrNull()
+        return (msg ?: t).replace(Regex("\\s+"), " ").take(240)
     }
 
     private fun parseArenaLine(line: String, b: Batcher) {
@@ -422,11 +442,14 @@ class ArenaNetworkEngine(
         try {
             call.execute().use { resp ->
                 if (!resp.isSuccessful) {
+                    val detail = errorDetail(runCatching { resp.body?.string().orEmpty() }.getOrDefault(""))
+                    val suffix = if (detail.isBlank()) "" else " $detail"
                     val hint = when (resp.code) {
-                        401, 403 -> "Access was refused (${resp.code}). Reconnect in Settings."
-                        404 -> "Endpoint or model not found (404). Check the model and API URL."
-                        429 -> "Rate limited (429). Try again shortly."
-                        else -> "Request failed (${resp.code})."
+                        401, 403 -> "Access was refused (${resp.code}). Reconnect in Settings.$suffix"
+                        404 -> "Endpoint or model not found (404). Check the model and API URL.$suffix"
+                        429 -> "Rate limited (429). Try again shortly.$suffix"
+                        400 -> "The server rejected the request (400).$suffix"
+                        else -> "Request failed (${resp.code}).$suffix"
                     }
                     emit(StreamChunk(error = hint))
                     return
