@@ -98,7 +98,7 @@ fun Composer(
             Spacer(Modifier.size(8.dp))
             Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 Box {
-                    PillButton(modeIcon(mode), mode.label, true) { menu = true }
+                    PillButton(modeIcon(mode), mode.label, true, onClick = { menu = true })
                     DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
                         ArenaMode.entries.forEach { m ->
                             DropdownMenuItem(
