@@ -95,9 +95,10 @@ def checkpoint(msg: str) -> int:
 
 def ci_status() -> int:
     token = pathlib.Path("/tmp/gitenv.sh").read_text().splitlines()[-1].replace("echo ", "").strip()
+    headers = {"Authorization": f"token {token}", "Accept": "application/vnd.github+json"}
     req = urllib.request.Request(
         f"https://api.github.com/repos/{REPO}/actions/runs?branch=main&per_page=3",
-        headers={"Authorization": f"token {token}", "Accept": "application/vnd.github+json"},
+        headers=headers,
     )
     with urllib.request.urlopen(req) as resp:
         data = json.loads(resp.read().decode())
@@ -105,8 +106,25 @@ def ci_status() -> int:
     if not runs:
         print("No CI runs yet.")
         return 0
-    for r in runs[:3]:
+    for r in runs[:2]:
         print(f"Run #{r['run_number']} [{r['status']}/{r.get('conclusion')}] {r['name']} ({r['head_sha'][:7]}) -> {r['html_url']}")
+        jobs_req = urllib.request.Request(r["jobs_url"], headers=headers)
+        with urllib.request.urlopen(jobs_req) as jresp:
+            jobs = json.loads(jresp.read().decode()).get("jobs", [])
+        for j in jobs:
+            for s in j.get("steps", []):
+                if s.get("status") == "in_progress" or s.get("conclusion") == "failure":
+                    print(f"   Step [{s.get('status')}/{s.get('conclusion')}]: {s.get('name')}")
+            if j.get("conclusion") == "failure":
+                cmd_log = (
+                    f'LOG_URL=$(curl -sI -H "Authorization: token {token}" '
+                    f'"https://api.github.com/repos/{REPO}/actions/jobs/{j["id"]}/logs" '
+                    f'| grep -i "^location:" | awk \'{{print $2}}\' | tr -d \'\\r\'); '
+                    f'curl -s "$LOG_URL" | grep -E "e: |FAILURE:|What went wrong|> Task .* FAILED" -A 3 | tail -n 45'
+                )
+                out = run(cmd_log, check=False).stdout
+                print("--- FAILED JOB LOG TAIL ---")
+                print(out)
     return 0
 
 
